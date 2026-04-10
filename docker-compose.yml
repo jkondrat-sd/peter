@@ -152,6 +152,7 @@ services:
 
   prometheus:
     image: prom/prometheus:v3.5.0
+    user: "0:0"
     container_name: prometheus
     depends_on:
       redis:
