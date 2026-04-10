@@ -9,6 +9,11 @@ services:
     command: redis-server --appendonly yes --appendfsync everysec --maxmemory 1gb --maxmemory-policy noeviction
     volumes:
       - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
 
   mysql-master:
     image: bitnami/mariadb:latest
@@ -21,6 +26,11 @@ services:
       - MARIADB_DATABASE=audit_log
     ports:
       - "3306:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-proot_pass"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 
   mysql-slave:
     image: bitnami/mariadb:latest
@@ -36,50 +46,132 @@ services:
       - MARIADB_MASTER_ROOT_PASSWORD=root_pass
     ports:
       - "3307:3306"
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-proot_pass"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
 
   producer:
     build: .
     container_name: producer-node
     volumes:
       - .:/app
-    command: ["/bin/sh", "-c", "go mod tidy && go run cmd/producer/main.go"]
+    command: ["go", "run", "./cmd/producer"]
     depends_on:
-      - redis
+      redis:
+        condition: service_healthy
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - STREAM_NAME=event_queue
+      - PRODUCER_WORKERS=20
+      - PRODUCER_INTERVAL=10ms
+      - PRODUCER_DEDUPE_TTL=5m
+      - METRICS_ADDR=:2111
 
   consumer:
     build: .
     container_name: consumer-node-1
     volumes:
       - .:/app
-    command: ["/bin/sh", "-c", "go mod tidy && go run cmd/consumer/main.go"]
+    command: ["go", "run", "./cmd/consumer"]
     depends_on:
-      - redis
-      - mysql-master
+      redis:
+        condition: service_healthy
+      mysql-master:
+        condition: service_healthy
+      mysql-slave:
+        condition: service_healthy
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - STREAM_NAME=event_queue
+      - STREAM_GROUP=processor_group
+      - DLQ_STREAM=event_queue_dlq
       - CONSUMER_NAME=consumer-node-1
-      - MYSQL_MASTER_DSN=root:root_pass@tcp(mysql-master:3306)/audit_log
-      - MYSQL_SLAVE_DSN=root:root_pass@tcp(mysql-slave:3306)/audit_log
+      - MYSQL_MASTER_DSN=root:root_pass@tcp(mysql-master:3306)/audit_log?parseTime=true
+      - MYSQL_SLAVE_DSN=root:root_pass@tcp(mysql-slave:3306)/audit_log?parseTime=true
+      - BATCH_SIZE=500
+      - FLUSH_INTERVAL=1s
+      - READ_COUNT=100
+      - READ_BLOCK=2s
+      - RECLAIM_INTERVAL=5s
+      - RECLAIM_MIN_IDLE=10s
+      - RECLAIM_COUNT=100
+      - MAX_DELIVERIES=5
+      - DB_TIMEOUT=3s
+      - SHUTDOWN_FLUSH_TIMEOUT=10s
+      - METRICS_ADDR=:2112
 
   consumer-2:
     build: .
     container_name: consumer-node-2
     volumes:
       - .:/app
-    command: ["/bin/sh", "-c", "go mod tidy && go run cmd/consumer/main.go"]
+    command: ["go", "run", "./cmd/consumer"]
     depends_on:
-      - redis
-      - mysql-master
+      redis:
+        condition: service_healthy
+      mysql-master:
+        condition: service_healthy
+      mysql-slave:
+        condition: service_healthy
     environment:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - STREAM_NAME=event_queue
+      - STREAM_GROUP=processor_group
+      - DLQ_STREAM=event_queue_dlq
       - CONSUMER_NAME=consumer-node-2
-      - MYSQL_MASTER_DSN=root:root_pass@tcp(mysql-master:3306)/audit_log
-      - MYSQL_SLAVE_DSN=root:root_pass@tcp(mysql-slave:3306)/audit_log
+      - MYSQL_MASTER_DSN=root:root_pass@tcp(mysql-master:3306)/audit_log?parseTime=true
+      - MYSQL_SLAVE_DSN=root:root_pass@tcp(mysql-slave:3306)/audit_log?parseTime=true
+      - BATCH_SIZE=500
+      - FLUSH_INTERVAL=1s
+      - READ_COUNT=100
+      - READ_BLOCK=2s
+      - RECLAIM_INTERVAL=5s
+      - RECLAIM_MIN_IDLE=10s
+      - RECLAIM_COUNT=100
+      - MAX_DELIVERIES=5
+      - DB_TIMEOUT=3s
+      - SHUTDOWN_FLUSH_TIMEOUT=10s
+      - METRICS_ADDR=:2113
+
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    container_name: prometheus
+    depends_on:
+      redis:
+        condition: service_healthy
+      producer:
+        condition: service_started
+      consumer:
+        condition: service_started
+      consumer-2:
+        condition: service_started
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deployments/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:12.1.1
+    container_name: grafana
+    depends_on:
+      - prometheus
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+      - GF_AUTH_ANONYMOUS_ORG_ROLE=Viewer
+      - GF_AUTH_DISABLE_LOGIN_FORM=false
+    volumes:
+      - ./deployments/grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./deployments/grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./deployments/grafana/dashboards:/var/lib/grafana/dashboards:ro
 
 volumes:
   redis_data:

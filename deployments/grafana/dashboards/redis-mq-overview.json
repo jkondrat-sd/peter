@@ -1,0 +1,136 @@
+{
+  "annotations": {
+    "list": []
+  },
+  "editable": true,
+  "graphTooltip": 0,
+  "panels": [
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 0 },
+      "id": 1,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(rate(redismq_producer_published_total[1m]))", "refId": "A" }
+      ],
+      "title": "Producer Publish Rate /s",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 6, "y": 0 },
+      "id": 2,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(rate(redismq_consumer_events_handled_total{result=\"persisted\"}[1m]))", "refId": "A" }
+      ],
+      "title": "Consumer Persist Rate /s",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 12, "y": 0 },
+      "id": 3,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(increase(redismq_consumer_dlq_total[15m]))", "refId": "A" }
+      ],
+      "title": "DLQ Events (15m)",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 6, "w": 6, "x": 18, "y": 0 },
+      "id": 4,
+      "options": {
+        "colorMode": "value",
+        "graphMode": "area",
+        "justifyMode": "auto",
+        "orientation": "auto",
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }
+      },
+      "targets": [
+        { "expr": "sum(redismq_consumer_pending_claimed)", "refId": "A" }
+      ],
+      "title": "Pending Claimed",
+      "type": "stat"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "id": 5,
+      "targets": [
+        { "expr": "sum by (consumer) (redismq_consumer_buffer_size)", "legendFormat": "{{consumer}}", "refId": "A" }
+      ],
+      "title": "Consumer Buffer Size",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "id": 6,
+      "targets": [
+        { "expr": "sum by (consumer, result) (rate(redismq_consumer_batch_flush_total[1m]))", "legendFormat": "{{consumer}} {{result}}", "refId": "A" }
+      ],
+      "title": "Batch Flush Result Rate",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "id": 7,
+      "targets": [
+        { "expr": "histogram_quantile(0.95, sum by (le, consumer, mode, result) (rate(redismq_consumer_db_write_seconds_bucket[5m])))", "legendFormat": "{{consumer}} {{mode}} {{result}}", "refId": "A" }
+      ],
+      "title": "DB Write P95 Latency",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "id": 8,
+      "targets": [
+        { "expr": "sum by (consumer, result) (increase(redismq_consumer_reclaim_total[15m]))", "legendFormat": "{{consumer}} {{result}}", "refId": "A" }
+      ],
+      "title": "Reclaim Activity (15m)",
+      "type": "timeseries"
+    },
+    {
+      "datasource": "Prometheus",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 22 },
+      "id": 9,
+      "targets": [
+        { "expr": "sum by (consumer, result) (rate(redismq_consumer_events_handled_total[1m]))", "legendFormat": "{{consumer}} {{result}}", "refId": "A" }
+      ],
+      "title": "Event Handling Rate",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "5s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["redis", "mq", "mysql"],
+  "templating": { "list": [] },
+  "time": { "from": "now-30m", "to": "now" },
+  "title": "Redis MQ Overview",
+  "uid": "redis-mq-overview",
+  "version": 1
+}

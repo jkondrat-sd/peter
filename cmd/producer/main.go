@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"os"
@@ -11,24 +12,24 @@ import (
 
 	"redismq/internal/config"
 	"redismq/internal/logger"
+	"redismq/internal/metrics"
 	"redismq/internal/redisx"
 
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
 
-const StreamName = "event_queue"
-
 func main() {
 	logger.InitLogger("producer")
-	slog.Info("Service Initialization: Producer Component Started")
+	slog.Info("producer started")
 
-	cfg := config.LoadRedisConfig()
-	rdb := redisx.NewClient(cfg)
+	cfg := config.LoadProducerConfig()
+	rdb := redisx.NewClient(cfg.Redis)
 
-	// 绑定操作系统终端信号至 Context，实现进程的平滑和安全退出
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+
+	metrics.StartServer(ctx, cfg.MetricsAddr)
 
 	if err := redisx.WaitForRedis(ctx, rdb); err != nil {
 		slog.Error("Redis connection initialization failed", "error", err)
@@ -37,45 +38,65 @@ func main() {
 
 	script := redis.NewScript(redisx.ProducerLuaScript)
 
-	slog.Info("⚠️ COMMENCING HIGH CONCURRENCY LOAD TEST: 20 Workers Firing Rapidly!")
+	slog.Info("producer workers online", "workers", cfg.Workers, "stream", cfg.StreamName, "interval", cfg.Interval.String())
 
-	// 启动 20 个高并发并发协程模拟大促洪峰
-	for i := 0; i < 200; i++ {
+	for i := 0; i < cfg.Workers; i++ {
 		go func(workerID int) {
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				default:
-					produceDataEvent(ctx, rdb, script)
-					// 微小休眠控制发包速率在单容器约 2000 QPS 左右
-					time.Sleep(10 * time.Millisecond)
+					produceDataEvent(ctx, rdb, script, cfg)
+					time.Sleep(cfg.Interval)
 				}
 			}
 		}(i)
 	}
 
-	// 阻塞停留在主线程响应系统退出
 	<-ctx.Done()
-	slog.Info("Shutdown signal received. Terminating producer loops.")
+	slog.Info("producer shutting down")
 }
 
-// produceDataEvent 封装消息生产的单次调用逻辑，依据 Context 进行链路级别调度控制
-func produceDataEvent(ctx context.Context, rdb *redis.Client, script *redis.Script) {
+func produceDataEvent(ctx context.Context, rdb *redis.Client, script *redis.Script, cfg config.ProducerConfig) {
+	eventID := uuid.NewString()
 	sessionID := uuid.New().String()
-	cacheKey := fmt.Sprintf("session:%s", sessionID)
-	sessionPayload := `{"user": "alice", "status": "active"}`
-	ttl := 300
-	streamPayload := fmt.Sprintf("STREAM_EVENT:%s", sessionID)
+	dedupeKey := fmt.Sprintf("dedupe:event:%s", eventID)
+	producedAt := time.Now().UTC()
 
-	keys := []string{cacheKey, StreamName}
-	args := []interface{}{sessionPayload, ttl, streamPayload}
-
-	// 触发执行底层的 Lua 事务脚本，保证两阶段提交在此过程中的绝对状态一致性
-	result, err := script.Run(ctx, rdb, keys, args...).Result()
+	payloadBytes, err := json.Marshal(map[string]string{
+		"event_id":   eventID,
+		"session_id": sessionID,
+		"user":       "alice",
+		"status":     "active",
+	})
 	if err != nil {
-		slog.Error("Failed to execute atomic operation", "error", err)
+		slog.Error("failed to marshal payload", "error", err)
 		return
 	}
-	slog.Info("Atomic publish transaction completed successfully", "cache_key", cacheKey, "stream_id", result)
+
+	keys := []string{dedupeKey, cfg.StreamName}
+	args := []interface{}{
+		eventID,
+		int(cfg.DedupeTTL / time.Second),
+		sessionID,
+		string(payloadBytes),
+		producedAt.Format(time.RFC3339Nano),
+	}
+
+	result, err := script.Run(ctx, rdb, keys, args...).Result()
+	if err != nil {
+		metrics.ProducerPublishFailedTotal.Inc()
+		slog.Error("failed to publish event", "event_id", eventID, "error", err)
+		return
+	}
+
+	if streamID, ok := result.(string); ok && streamID != "" {
+		metrics.ProducerPublishedTotal.Inc()
+		slog.Info("event published", "event_id", eventID, "stream_id", streamID)
+		return
+	}
+
+	metrics.ProducerDuplicateSuppressedTotal.Inc()
+	slog.Warn("duplicate event suppressed", "event_id", eventID)
 }

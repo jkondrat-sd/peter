@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: redis-mq
+    orgId: 1
+    folder: Redis MQ
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    options:
+      path: /var/lib/grafana/dashboards
