@@ -204,6 +204,24 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 
 ## 6. 本地启动
 
+如果你在国内网络环境，建议先设置 Go 代理：
+
+```bash
+go env -w GOPROXY=https://goproxy.cn,direct
+```
+
+这个仓库的 `Dockerfile` 和 `docker-compose.yml` 也已经默认使用：
+
+```text
+https://goproxy.cn,direct
+```
+
+如果你想临时切换成别的代理，可以在启动 Compose 时覆盖：
+
+```bash
+GOPROXY=https://goproxy.io,direct docker compose up --build
+```
+
 ```bash
 docker compose up --build
 ```

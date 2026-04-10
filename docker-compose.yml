@@ -53,7 +53,10 @@ services:
       retries: 20
 
   producer:
-    build: .
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
     container_name: producer-node
     volumes:
       - .:/app
@@ -69,9 +72,13 @@ services:
       - PRODUCER_INTERVAL=10ms
       - PRODUCER_DEDUPE_TTL=5m
       - METRICS_ADDR=:2111
+      - GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 
   consumer:
-    build: .
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
     container_name: consumer-node-1
     volumes:
       - .:/app
@@ -103,9 +110,13 @@ services:
       - DB_TIMEOUT=3s
       - SHUTDOWN_FLUSH_TIMEOUT=10s
       - METRICS_ADDR=:2112
+      - GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 
   consumer-2:
-    build: .
+    build:
+      context: .
+      args:
+        GOPROXY: ${GOPROXY:-https://goproxy.cn,direct}
     container_name: consumer-node-2
     volumes:
       - .:/app
@@ -137,6 +148,7 @@ services:
       - DB_TIMEOUT=3s
       - SHUTDOWN_FLUSH_TIMEOUT=10s
       - METRICS_ADDR=:2113
+      - GOPROXY=${GOPROXY:-https://goproxy.cn,direct}
 
   prometheus:
     image: prom/prometheus:v3.5.0
