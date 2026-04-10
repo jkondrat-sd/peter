@@ -36,19 +36,28 @@ func main() {
 	}
 
 	script := redis.NewScript(redisx.ProducerLuaScript)
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+	
+	slog.Info("⚠️ COMMENCING HIGH CONCURRENCY LOAD TEST: 20 Workers Firing Rapidly!")
 
-	// 基于 Context 驱动的生产主循环
-	for {
-		select {
-		case <-ctx.Done():
-			slog.Info("Shutdown signal received. Terminating producer loops.")
-			return
-		case <-ticker.C:
-			produceDataEvent(ctx, rdb, script)
-		}
+	// 启动 20 个高并发并发协程模拟大促洪峰
+	for i := 0; i < 20; i++ {
+		go func(workerID int) {
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					produceDataEvent(ctx, rdb, script)
+					// 微小休眠控制发包速率在单容器约 2000 QPS 左右
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+		}(i)
 	}
+
+	// 阻塞停留在主线程响应系统退出
+	<-ctx.Done()
+	slog.Info("Shutdown signal received. Terminating producer loops.")
 }
 
 // produceDataEvent 封装消息生产的单次调用逻辑，依据 Context 进行链路级别调度控制
