@@ -36,11 +36,11 @@ func main() {
 	}
 
 	script := redis.NewScript(redisx.ProducerLuaScript)
-	
+
 	slog.Info("⚠️ COMMENCING HIGH CONCURRENCY LOAD TEST: 20 Workers Firing Rapidly!")
 
 	// 启动 20 个高并发并发协程模拟大促洪峰
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 200; i++ {
 		go func(workerID int) {
 			for {
 				select {
@@ -65,7 +65,7 @@ func produceDataEvent(ctx context.Context, rdb *redis.Client, script *redis.Scri
 	sessionID := uuid.New().String()
 	cacheKey := fmt.Sprintf("session:%s", sessionID)
 	sessionPayload := `{"user": "alice", "status": "active"}`
-	ttl := 300 
+	ttl := 300
 	streamPayload := fmt.Sprintf("STREAM_EVENT:%s", sessionID)
 
 	keys := []string{cacheKey, StreamName}

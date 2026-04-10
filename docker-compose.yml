@@ -6,6 +6,9 @@ services:
     container_name: redis-node
     ports:
       - "6379:6379"
+    command: redis-server --appendonly yes --appendfsync everysec --maxmemory 1gb --maxmemory-policy noeviction
+    volumes:
+      - redis_data:/data
 
   mysql-master:
     image: bitnami/mariadb:latest
@@ -77,3 +80,6 @@ services:
       - CONSUMER_NAME=consumer-node-2
       - MYSQL_MASTER_DSN=root:root_pass@tcp(mysql-master:3306)/audit_log
       - MYSQL_SLAVE_DSN=root:root_pass@tcp(mysql-slave:3306)/audit_log
+
+volumes:
+  redis_data:
