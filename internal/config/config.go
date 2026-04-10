@@ -63,7 +63,7 @@ func LoadProducerConfig() ProducerConfig {
 	return ProducerConfig{
 		StreamName:  getEnv("STREAM_NAME", "event_queue"),
 		DedupeTTL:   getEnvDuration("PRODUCER_DEDUPE_TTL", 5*time.Minute),
-		Workers:     getEnvInt("PRODUCER_WORKERS", 20),
+		Workers:     getEnvInt("PRODUCER_WORKERS", 50),
 		Interval:    getEnvDuration("PRODUCER_INTERVAL", 10*time.Millisecond),
 		MetricsAddr: getEnv("METRICS_ADDR", ":2111"),
 		Redis:       LoadRedisConfig(),
