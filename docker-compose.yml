@@ -68,7 +68,7 @@ services:
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - STREAM_NAME=event_queue
-      - PRODUCER_WORKERS=20
+      - PRODUCER_WORKERS=100
       - PRODUCER_INTERVAL=10ms
       - PRODUCER_DEDUPE_TTL=5m
       - METRICS_ADDR=:2111

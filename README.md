@@ -1,355 +1,384 @@
-# Redis Stream + MySQL 金融日志高可靠最终一致性 Demo
+# Redis Stream + MySQL 金融日志旁路入库 Demo
 
-这个仓库实现的是一个面向金融审计/交易日志旁路入库场景的高可靠最终一致性 demo：
 
-- 主业务链路与日志落库链路解耦
-- 生产者把日志事件原子写入 Redis Stream
-- 消费者用 Consumer Group 做批量拉取、幂等落库和失败恢复
-- MySQL 作为最终审计存储
-- Redis DLQ 用来隔离永久失败消息，并支持后续 replay
+## 1. 背景
 
-目标不是强一致事务日志，而是：
+### Situation
 
-- 在高并发场景下避免日志旁路入库成为主交易瓶颈
-- 通过 `at-least-once + 幂等落库 + reclaim + DLQ + replay` 保障日志最终可达
-- 在工程复杂度可控的前提下，把“不丢、可恢复、可对账”放在优先级前面
+在高并发交易、支付、审计、风控留痕这类场景里，主交易链路往往要求低延迟，但日志、流水、审计数据又不能轻易丢失。
 
-## 1. 可靠性语义
+如果把金融日志直接同步写 MySQL，常见问题会很快出现：
 
-### 交付语义
+- 主交易接口 RT 被日志写库拖慢
+- MySQL 在突发高峰时被大量小事务打满
+- 一旦数据库抖动，主业务和日志链路一起受影响
+- 业务代码里会充满“失败重试、补偿、兜底写库”的复杂逻辑
 
-- 本方案的目标语义是 `eventual consistency`
-- Redis Stream 消费侧采用 `at-least-once`
-- MySQL 落库通过业务主键 `event_id` 做幂等收敛
-- ACK 只会在以下两种情况下发生：
-  - 事件已经成功写入 MySQL
-  - 事件已经被成功转移到 DLQ
+这就是这个 demo 想解决的起点：日志不能成为主交易链路的阻塞点，但日志本身又必须做到最终可达、可恢复、可对账。
 
-这意味着：
+### 为什么不直接用 Kafka
 
-- 数据库瞬时失败时，消息会继续留在 PEL，等待后续 reclaim
-- ACK 失败时最多造成重复投递，不会造成静默丢失
-- 重复投递会被 `ON DUPLICATE KEY UPDATE` 安全吸收
+这个场景里并不是 Kafka 不好，而是这里刻意选择了更轻量的方案。
 
-它不提供“主业务提交成功时日志已同步落入 MySQL”的强一致保证；它提供的是“主业务成功后，日志最终会被可靠补齐到审计库”的工程保证。
+不直接上 Kafka 的主要原因是：
 
-### 生产端幂等
+- 目标是做一个小而完整的 demo，强调高可靠最终一致性，不是演示大规模 MQ 集群治理
+- 对很多中小团队来说，Kafka 的部署、分区、Broker 运维、消费位点治理和容量规划成本更高
+- 这里的问题核心首先是“旁路削峰 + 异步落库 + 故障补偿”，这些能力 Redis Stream 已经能提供最小闭环
+- 在单机到中等规模场景里，Redis Stream 的接入成本更低，更适合快速验证架构思路
 
-生产者使用 Lua 在 Redis 内完成：
+所以这里不是说 Kafka 不适合，而是这个 demo 的目标是：先用更低复杂度的基础设施，把金融日志高可靠最终一致性的核心机制讲清楚。
 
-1. `SET NX EX` 写入去重键
-2. `XADD` 写入 Stream
+## 2. 目标
 
-两步在同一个 Lua 脚本中执行，避免“去重标记成功但消息没入流”或“消息已入流但去重状态缺失”的中间态。
+### Task
 
-### 消费端失败处理
+这个 demo 要解决的问题可以归纳成四点：
 
-- 批量落库成功：批量 `XACK`
-- 批量落库遇到可重试错误：不 ACK，消息保持 pending
-- 批量落库遇到不可重试错误：降级为单条处理
-- 单条处理成功：`XACK`
-- 单条处理为可重试错误：不 ACK，等待 reclaim
-- 单条处理为不可重试错误：写入 DLQ 后 `XACK`
+1. 主交易链路不能被金融日志写库阻塞。
+2. 高并发下日志要能先削峰、排队，再异步落库。
+3. 日志链路在 Redis、消费者、MySQL 出现短时故障时，不能静默丢失。
+4. 最终结果要能落到 MySQL 审计表里，并具备 replay 和后续对账的基础。
 
-### Pending reclaim
+这套方案追求的不是强一致，而是：
 
-后台 reclaim worker 周期性扫描超过 `MinIdle` 的 pending 消息：
+- `eventual consistency`
+- `at-least-once`
+- 幂等落库
+- 故障可恢复
+- 审计结果最终可达
 
-- 使用 `XPENDING` 获取真实投递次数
-- 使用 `XCLAIM` 把超时消息转移到当前消费者
-- 超过 `MaxDeliveries` 的消息直接转入 DLQ
-- 未超过上限的消息重新按单条流程处理
+换句话说，它的目标不是“主业务成功时日志已经同步写进 MySQL”，而是“主业务成功后，日志最终会被可靠补齐进审计库”。
 
-这保证了消费者宕机、重启或 flush 期间异常退出时，消息仍然能被后续节点接管。
+## 3. 先解释几个核心术语
 
-### DLQ replay
+为了让后面的方案描述更容易理解，这里先把文中反复出现的几个词说明白。
 
-DLQ 不是终点。对于因为脏数据、临时 bug 或下游修复前失败的日志，可以在修复完成后执行 replay，把 DLQ 中的事件重新写回主 Stream。
+### ACK
 
-本仓库提供了单独的 replay 工具：
+`ACK` 是 `acknowledgement`，意思是“消费者确认这条消息已经处理完成”。
 
-```bash
-go run ./cmd/replaydlq
+在 Redis Stream Consumer Group 里，一条消息被消费者读到以后，并不会自动消失。只有消费者显式执行 `XACK`，Redis 才会认为这条消息已经处理完，可以从待确认集合里移除。
+
+这个 demo 里，`ACK` 的含义非常具体：
+
+- 写入 MySQL 成功，才 ACK
+- 或者写入 DLQ 成功，才 ACK
+
+为什么这么严格：
+
+- 如果先 ACK、后写库，消费者一旦崩溃，消息就真的丢了
+- 对金融日志来说，重复可以靠幂等处理，但丢失很难补
+
+### PEL
+
+`PEL` 是 `Pending Entries List`，也就是“待确认消息列表”。
+
+你可以把它理解成：
+
+- Redis 已经把消息交给某个消费者了
+- 但这个消费者还没有 ACK
+- 所以 Redis 暂时把它记在 pending 里
+
+PEL 的存在很关键，因为它让系统知道：
+
+- 哪些消息已经发出去但还没真正处理完
+- 哪些消息可能因为消费者挂掉而需要后续接管
+
+### reclaim
+
+`reclaim` 可以理解成“消息接管”或“超时回收”。
+
+当一条消息长时间停留在 PEL 里，说明原来的消费者可能已经：
+
+- 崩溃了
+- 卡住了
+- 写库失败后一直没处理完
+
+这时另一个消费者可以把这条超时 pending 消息重新认领过来，再处理一次。这个过程在 README 里就叫 reclaim。
+
+### DLQ
+
+`DLQ` 是 `Dead Letter Queue`，也就是“死信队列”。
+
+它用来存放那些短时间内无法正常落库、或者已经超过重试上限的消息。
+
+为什么要有 DLQ：
+
+- 不能让坏消息一直堵住主消费链路
+- 也不能因为处理失败就直接丢弃
+
+所以更合理的办法是：
+
+- 先把失败消息隔离出来
+- 后面修复问题后再 replay
+
+### replay
+
+`replay` 就是“重放”或“回灌”。
+
+它的意思是：
+
+- 从 DLQ 里把之前失败的消息重新拿出来
+- 再次写回主 Stream
+- 让消费者重新处理
+
+这样做的目的不是重复制造消息，而是把之前因为临时故障、脏数据、程序 bug 导致失败的日志，在问题修复后重新补齐。
+
+### at-least-once
+
+`at-least-once` 的意思是：系统保证消息至少会被投递一次，但在故障恢复、超时接管、重复消费时，可能会被投递多次。
+
+这不是缺点，而是一种常见的可靠性取舍：
+
+- 优先保证“不丢”
+- 重复由下游幂等去吸收
+
+对于金融日志这种场景，这通常比“可能少投一次但绝不重复”更安全。
+
+## 4. 我们做了什么
+
+### Action
+
+围绕上面的目标，这个 demo 做了 5 件核心事情。
+
+### 3.1 生产端把“去重标记 + 入流”做成一个原子动作
+
+关键代码：
+
+- [scripts.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/redisx/scripts.go)
+- [main.go](/Users/gaosong/source_code/mq_redis/redis_mq/cmd/producer/main.go)
+
+关键片段在 [scripts.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/redisx/scripts.go)：
+
+```lua
+local inserted = redis.call('SET', KEYS[1], ARGV[1], 'NX', 'EX', ARGV[2])
+if not inserted then
+	return ''
+end
+
+local msg_id = redis.call(
+	'XADD',
+	KEYS[2],
+	'*',
+	'event_id', ARGV[1],
+	'session_id', ARGV[3],
+	'payload', ARGV[4],
+	'produced_at', ARGV[5]
+)
+return msg_id
 ```
 
-可选参数：
+为什么这么做：
 
-- `DLQ_REPLAY_COUNT`：单次最多 replay 多少条，默认 `100`
-- `DLQ_REPLAY_KEEP_SOURCE`：是否保留原始 DLQ 记录，默认 `false`
+- 避免“去重标记写成功了，但消息没入流”
+- 避免“消息入流了，但去重状态没写成功”
+- 让生产端至少先把事件稳定推进到 Redis Stream
 
-## 2. 当前架构
+好处：
 
-```text
-.
-├── cmd/
-│   ├── consumer/main.go
-│   └── producer/main.go
-│   └── replaydlq/main.go
-├── internal/
-│   ├── config/
-│   │   └── config.go
-│   ├── consumer/
-│   │   ├── service.go
-│   │   └── service_test.go
-│   ├── dbx/
-│   │   ├── middleware.go
-│   │   └── mysql.go
-│   ├── logger/
-│   │   └── logger.go
-│   ├── model/
-│   │   └── event.go
-│   └── redisx/
-│       ├── client.go
-│       └── scripts.go
-├── docker-compose.yml
-└── README.md
-```
+- 生产端逻辑简单
+- 高并发下不会把状态一致性问题甩给业务层
+- 为后续 `at-least-once + 幂等落库` 提供稳定入口
 
-职责划分：
+### 3.2 消费端只在两种情况下 ACK
 
-- `cmd/*`：进程装配与生命周期管理
-- `internal/config`：环境变量配置加载
-- `internal/model`：Stream 事件模型与解析
-- `internal/consumer`：消费、flush、reclaim、DLQ 状态机
-- `internal/dbx`：MySQL 连接池、建表、批量幂等落库
-- `internal/redisx`：Redis 客户端与生产端 Lua 脚本
-- `cmd/replaydlq`：DLQ 回灌工具
+关键代码：
 
-## 3. 数据流
+- [service.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/consumer/service.go)
 
-```mermaid
-sequenceDiagram
-    autonumber
-    participant P as Producer
-    participant R as Redis Stream
-    participant C as Consumer Group
-    participant M as MySQL Master
-    participant D as DLQ Stream
+关键片段在 [service.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/consumer/service.go) 的 `persistBatch`、`handleSingle`、`moveEventToDLQ` 一组逻辑。
 
-    P->>R: Lua(SET NX EX + XADD)
-    R-->>P: stream_id / duplicate suppressed
+这套 ACK 规则是：
 
-    C->>R: XREADGROUP
-    R-->>C: events
+- 成功写入 MySQL 后，才 `XACK`
+- 成功写入 DLQ 后，才 `XACK`
 
-    alt batch write succeeds
-        C->>M: batch upsert
-        M-->>C: ok
-        C->>R: XACK
-    else retryable DB error
-        C-->>R: leave pending
-    else non-retryable batch error
-        loop each event
-            C->>M: single upsert
-            alt single succeeds
-                C->>R: XACK
-            else retryable error
-                C-->>R: leave pending
-            else permanent error
-                C->>D: XADD DLQ
-                C->>R: XACK
-            end
-        end
-    end
+为什么这么做：
 
-    loop reclaim
-        C->>R: XPENDING + XCLAIM
-        alt retry count too high
-            C->>D: XADD DLQ
-            C->>R: XACK
-        else retry again
-            C->>M: single upsert
-        end
-    end
-```
+- 如果在持久化前 ACK，消费者进程崩溃、网络闪断、数据库超时都会导致消息直接丢失
+- 旁路金融日志最怕的不是重复，而是静默丢失
 
-## 4. 它为什么更适合金融日志旁路
+好处：
 
-这套方案最适合的不是“资金余额强一致更新”，而是：
+- 失败时消息继续留在 PEL
+- 即使发生重复投递，也可以交给下游幂等吸收
+- 不会因为错误的 ACK 时机造成不可恢复的数据缺口
 
-- 交易审计日志
-- 风控流水
-- 操作留痕
-- 对账辅助事件
+### 3.3 MySQL 端用主键幂等收敛重复投递
 
-原因是它把关键目标放在了下面这几个能力上：
+关键代码：
 
-- 主交易链路不被日志落库阻塞
-- 日志链路在高峰期可削峰、可排队
-- 出现故障后可以继续补偿，不依赖人工从零找回
-- 通过幂等主键和 replay 机制避免重复入库污染审计表
+- [mysql.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/dbx/mysql.go)
 
-如果你要承诺更强的“不丢”语义，建议继续补这几层：
-
-1. Redis 提升为更严格的持久化与副本确认策略
-2. 增加业务流水与审计表之间的对账任务
-3. 为 replay 增加审批、批次号和操作审计
-4. 为 producer 增加入口级限流和背压控制
-
-## 5. MySQL 表设计
-
-消费者启动时会自动创建表：
+关键片段在 [mysql.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/dbx/mysql.go) 的 `UpsertAuditLogs`：
 
 ```sql
-CREATE TABLE IF NOT EXISTS audit_logs (
-    event_id VARCHAR(100) PRIMARY KEY,
-    stream_id VARCHAR(100) NOT NULL,
-    session_id VARCHAR(100) NOT NULL,
-    payload TEXT NOT NULL,
-    produced_at TIMESTAMP NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    KEY idx_audit_logs_session_id (session_id),
-    KEY idx_audit_logs_created_at (created_at)
-);
+INSERT INTO audit_logs (event_id, stream_id, session_id, payload, produced_at) VALUES ...
+ON DUPLICATE KEY UPDATE
+  stream_id = VALUES(stream_id),
+  session_id = VALUES(session_id),
+  payload = VALUES(payload),
+  produced_at = VALUES(produced_at),
+  updated_at = CURRENT_TIMESTAMP
 ```
 
-说明：
+为什么这么做：
 
-- `event_id` 是幂等主键
-- `stream_id` 保留 Stream 侧观测信息，便于排障
-- `payload` 保存原始消息体
+- Redis Stream 消费语义天然更接近 `at-least-once`
+- 一旦有 reclaim、重试、重复投递，数据库必须能吸收重复事件
 
-## 6. 配置项
+好处：
 
-### Redis / Stream
+- 消费端可以把重点放在“不丢消息”
+- 不需要为了避免重复而冒险提前 ACK
+- replay 时也可以复用同一个 `event_id`，不会写出重复账
 
-- `REDIS_HOST`，默认 `localhost`
-- `REDIS_PORT`，默认 `6379`
-- `STREAM_NAME`，默认 `event_queue`
-- `STREAM_GROUP`，默认 `processor_group`
-- `DLQ_STREAM`，默认 `event_queue_dlq`
+### 3.4 消费失败时分层处理：重试、降级、DLQ
 
-### Producer
+关键代码：
 
-- `PRODUCER_WORKERS`，默认 `20`
-- `PRODUCER_INTERVAL`，默认 `10ms`
-- `PRODUCER_DEDUPE_TTL`，默认 `5m`
+- [service.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/consumer/service.go)
 
-### Consumer
+关键片段：
 
-- `CONSUMER_NAME`，默认 `consumer-node-1`
-- `BATCH_SIZE`，默认 `500`
-- `FLUSH_INTERVAL`，默认 `1s`
-- `READ_COUNT`，默认 `100`
-- `READ_BLOCK`，默认 `2s`
-- `RECLAIM_INTERVAL`，默认 `5s`
-- `RECLAIM_MIN_IDLE`，默认 `10s`
-- `RECLAIM_COUNT`，默认 `100`
-- `MAX_DELIVERIES`，默认 `5`
-- `DB_TIMEOUT`，默认 `3s`
-- `SHUTDOWN_FLUSH_TIMEOUT`，默认 `10s`
+- `flushBuffer`
+- `handleSingle`
+- `reclaimPending`
 
-### MySQL
+为什么这么做：
 
-- `MYSQL_MASTER_DSN`
-- `MYSQL_SLAVE_DSN`
+- 批量写库是为了吞吐
+- 但批量失败时，不能把整批都当成永久失败
+- 需要区分“数据库暂时不可用”和“单条消息本身有问题”
 
-默认值：
+当前策略是：
 
-- `root:root_pass@tcp(localhost:3306)/audit_log?parseTime=true`
-- `root:root_pass@tcp(localhost:3307)/audit_log?parseTime=true`
+- 批量成功：批量 `XACK`
+- 批量可重试错误：留在 pending，等待后续 reclaim
+- 批量不可重试错误：降级为单条处理
+- 单条永久失败：进入 DLQ
 
-## 7. 本地启动
+好处：
 
-如果你在国内网络环境，建议先设置 Go 代理：
+- 既保留了微批吞吐
+- 又避免一条坏消息拖死整批正常消息
+- 失败消息能被明确隔离，方便后续修复和人工介入
 
-```bash
-go env -w GOPROXY=https://goproxy.cn,direct
-```
+### 3.5 给 DLQ 增加 replay 闭环
 
-这个仓库的 `Dockerfile` 和 `docker-compose.yml` 也已经默认使用：
+关键代码：
 
-```text
-https://goproxy.cn,direct
-```
+- [main.go](/Users/gaosong/source_code/mq_redis/redis_mq/cmd/replaydlq/main.go)
+- [dlq.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/model/dlq.go)
 
-如果你想临时切换成别的代理，可以在启动 Compose 时覆盖：
+为什么这么做：
 
-```bash
-GOPROXY=https://goproxy.io,direct docker compose up --build
-```
+- 金融日志链路不能只做到“失败隔离”
+- 真正有价值的是“修复后可以补回来”
 
-```bash
-docker compose up --build
-```
+replay 工具会：
 
-Compose 做了几件事：
+- 从 DLQ 读取失败事件
+- 重建原始 `event_id/session_id/payload/produced_at`
+- 重新写回主 Stream
+- 让消费者再次按原有路径幂等落库
 
-- 启动 Redis，并开启 AOF `appendfsync everysec`
-- 启动 MariaDB 主从
-- 启动 1 个生产者和 2 个消费者
-- 通过 healthcheck 等待 Redis / MySQL 就绪后再拉起业务进程
+好处：
 
-### 监控入口
+- 最终一致性真正形成闭环
+- 失败不再只是“堆在 DLQ 等人工看”
+- 后续可以继续扩展成审批式 replay、批次 replay、操作审计
 
-拉起后可以直接打开：
+## 5. 结果
 
-- Grafana: `http://localhost:3000`
-- Prometheus: `http://localhost:9090`
+### Result
 
-Grafana 默认账号：
+这套 demo 最终达成的是：
 
-- 用户名：`admin`
-- 密码：`admin`
+- 主交易链路和日志落库链路完成了解耦
+- Redis Stream 承担了高峰期削峰和排队的角色
+- 消费侧通过 `at-least-once + 幂等落库` 把重点放在“不丢”
+- 故障时可以通过 reclaim 接管 pending 消息
+- 永久失败消息会进入 DLQ
+- 修复后可以通过 replay 重新补齐
 
-Grafana 会自动加载 `Redis MQ Overview` 仪表盘，不需要手动配数据源。
+也就是说，这个 demo 已经不是一个简单的“异步写库示例”，而是一条具备最小可靠性闭环的金融日志旁路入库链路。
 
-### 当前已暴露的指标
+## 6. 优点和不足
 
-- 生产速率：`redismq_producer_published_total`
-- 生产失败数：`redismq_producer_publish_failed_total`
-- 去重抑制数：`redismq_producer_duplicate_suppressed_total`
-- 消费事件结果：`redismq_consumer_events_handled_total`
-- 批量 flush 结果：`redismq_consumer_batch_flush_total`
-- DLQ 进入量：`redismq_consumer_dlq_total`
-- reclaim 活动：`redismq_consumer_reclaim_total`
-- poll 错误数：`redismq_consumer_poll_errors_total`
-- 内存 buffer 大小：`redismq_consumer_buffer_size`
-- 最近一次 reclaim 认领数：`redismq_consumer_pending_claimed`
-- 批大小分布：`redismq_consumer_batch_size`
-- DB 写入延迟：`redismq_consumer_db_write_seconds`
+### 优点
 
-## 8. 关键实现决策
+1. 架构足够轻。
+不依赖 Kafka，就能把削峰、异步消费、幂等落库、失败隔离、回放闭环这套最关键的能力先跑起来。
 
-### 为什么 ACK 放在 DB 成功之后
+2. 可靠性语义比较清楚。
+它不是假装“强一致”，而是明确站在最终一致性的立场上，把重点放在最终可达和尽量不丢。
 
-这是整个链路最核心的约束。只要在持久化之前 ACK，就会在进程崩溃、数据库超时或网络闪断时造成不可恢复的数据丢失。
+3. 对金融日志场景更贴切。
+对于审计、流水、风控留痕这类旁路数据，真正重要的是不丢、可恢复、可对账，而不是让日志同步阻塞主交易。
 
-### 为什么批量失败后要降级成单条
+4. 工程扩展路径明确。
+现在已经有生产、消费、reclaim、DLQ、replay、监控，再往上加对账、背压、审批式 replay 都是顺着现有结构演进。
 
-批量写库更高效，但一旦整批失败，我们需要区分：
+### 不足
 
-- 只是数据库暂时不可用
-- 还是某条消息本身不可处理
+1. Redis 仍然是当前阶段的核心瓶颈。
+在高并发下，单 Redis 单线程很容易先到上限。
 
-降级到单条后，才能把真正的坏消息隔离到 DLQ，而不拖住整批正常消息。
+怎么克服：
 
-### 为什么 reclaim 走单条重放
+- 做 producer 背压
+- 做 Stream 分片
+- 做 Redis 多实例路由
+- 在更高量级再演进到 Kafka 或更强的消息中枢
 
-reclaim 的目标是恢复正确性，不是追求峰值吞吐。超时消息通常意味着消费者曾经异常退出、数据库波动或消息本身存在问题，此时单条重放更容易控制风险和记录原因。
+2. 这不是强一致事务日志。
+如果你的定义是“业务提交成功时，日志必须已经和主事务一起提交成功”，那这套不是那个语义。
 
-## 9. 当前边界
+怎么克服：
 
-这个仓库已经具备金融日志高可靠最终一致性的最小闭环，但仍有明确边界：
+- 把日志事件先写入更强的持久层
+- 引入业务本地 WAL / Outbox
+- 在更高要求场景采用事务消息或更强的一致性方案
 
-- 已有 Prometheus 与 Grafana 面板，但还没有告警规则
-- DLQ 已支持 replay，但还没有审批流、批次号和操作留痕
-- 没有做分库分表、跨机房容灾、限流熔断
-- 没有做集成测试与压测基准
-- 生产者示例目前是演示流量，不是业务 API
+3. 还缺正式的对账能力。
+现在有幂等、reclaim、replay，但还没有把“业务流水数、Redis 事件数、MySQL 落库数、DLQ 数”自动对平。
 
-如果你要继续往线上化推进，下一步最值得补的是：
+怎么克服：
 
-1. 告警规则：DLQ 激增、DB 延迟升高、持续 reclaim
-2. 对账任务：按业务流水核对 Redis 事件数、DB 落库数、DLQ 数
-3. 集成测试：容器内验证重复投递、DB 故障、消费者崩溃恢复
-4. 后压控制：根据 pending 和 DB 延迟动态调低消费速度
+- 增加定时对账任务
+- 引入批次号和账务核对维度
+- 做异常差异报警
 
-## 10. 验证
+4. replay 还不够审计化。
+现在 replay 已经能用，但还没有操作审批、批次记录、操作者留痕。
 
-本地静态验证已通过：
+怎么克服：
 
-```bash
-go test ./...
-```
+- 给 replay 增加 batch_id
+- 记录 replay_operator / replay_reason
+- 把 replay 本身也纳入审计表
+
+5. 还没有主动背压。
+当前更多是 Redis 在被动承压，还不是系统主动调速。
+
+怎么克服：
+
+- 根据 Redis CPU、stream lag、consumer buffer、DB latency 动态调整 producer 速率
+- 在入口做限流与降级
+
+## 7. 关键文件索引
+
+- 生产端原子入流：[scripts.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/redisx/scripts.go)
+- Producer 入口：[main.go](/Users/gaosong/source_code/mq_redis/redis_mq/cmd/producer/main.go)
+- Consumer 核心状态机：[service.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/consumer/service.go)
+- MySQL 幂等落库：[mysql.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/dbx/mysql.go)
+- 事件模型：[event.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/model/event.go)
+- DLQ 模型：[dlq.go](/Users/gaosong/source_code/mq_redis/redis_mq/internal/model/dlq.go)
+- DLQ replay 工具：[main.go](/Users/gaosong/source_code/mq_redis/redis_mq/cmd/replaydlq/main.go)
+- 部署入口：[docker-compose.yml](/Users/gaosong/source_code/mq_redis/redis_mq/docker-compose.yml)
+
+## 8. 一句话总结
+
+这不是一个“用 Redis 代替 Kafka”的 demo，而是一个围绕金融日志旁路入库场景，演示如何用较低基础设施复杂度做出一条高可靠、最终一致、可恢复、可 replay 的异步持久化链路。
