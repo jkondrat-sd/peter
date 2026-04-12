@@ -1,18 +1,24 @@
-# Redis Stream + MySQL 异步落库生产级最小方案
+# Redis Stream + MySQL 金融日志高可靠最终一致性 Demo
 
-这个仓库实现的是一个面向最终一致性写入场景的轻量消息管道：
+这个仓库实现的是一个面向金融审计/交易日志旁路入库场景的高可靠最终一致性 demo：
 
-- 生产者把业务事件原子写入 Redis Stream
-- 消费者用 Consumer Group 做批量拉取和微批落库
-- MySQL 作为最终存储
-- Redis DLQ 用来隔离永久失败消息
+- 主业务链路与日志落库链路解耦
+- 生产者把日志事件原子写入 Redis Stream
+- 消费者用 Consumer Group 做批量拉取、幂等落库和失败恢复
+- MySQL 作为最终审计存储
+- Redis DLQ 用来隔离永久失败消息，并支持后续 replay
 
-目标不是替代 Kafka，而是在中小规模写入链路里，提供一套比“直接异步 goroutine 写库”更可靠、比“全量引入重量级 MQ”更轻的方案。
+目标不是强一致事务日志，而是：
+
+- 在高并发场景下避免日志旁路入库成为主交易瓶颈
+- 通过 `at-least-once + 幂等落库 + reclaim + DLQ + replay` 保障日志最终可达
+- 在工程复杂度可控的前提下，把“不丢、可恢复、可对账”放在优先级前面
 
 ## 1. 可靠性语义
 
 ### 交付语义
 
+- 本方案的目标语义是 `eventual consistency`
 - Redis Stream 消费侧采用 `at-least-once`
 - MySQL 落库通过业务主键 `event_id` 做幂等收敛
 - ACK 只会在以下两种情况下发生：
@@ -24,6 +30,8 @@
 - 数据库瞬时失败时，消息会继续留在 PEL，等待后续 reclaim
 - ACK 失败时最多造成重复投递，不会造成静默丢失
 - 重复投递会被 `ON DUPLICATE KEY UPDATE` 安全吸收
+
+它不提供“主业务提交成功时日志已同步落入 MySQL”的强一致保证；它提供的是“主业务成功后，日志最终会被可靠补齐到审计库”的工程保证。
 
 ### 生产端幂等
 
@@ -54,6 +62,21 @@
 
 这保证了消费者宕机、重启或 flush 期间异常退出时，消息仍然能被后续节点接管。
 
+### DLQ replay
+
+DLQ 不是终点。对于因为脏数据、临时 bug 或下游修复前失败的日志，可以在修复完成后执行 replay，把 DLQ 中的事件重新写回主 Stream。
+
+本仓库提供了单独的 replay 工具：
+
+```bash
+go run ./cmd/replaydlq
+```
+
+可选参数：
+
+- `DLQ_REPLAY_COUNT`：单次最多 replay 多少条，默认 `100`
+- `DLQ_REPLAY_KEEP_SOURCE`：是否保留原始 DLQ 记录，默认 `false`
+
 ## 2. 当前架构
 
 ```text
@@ -61,6 +84,7 @@
 ├── cmd/
 │   ├── consumer/main.go
 │   └── producer/main.go
+│   └── replaydlq/main.go
 ├── internal/
 │   ├── config/
 │   │   └── config.go
@@ -89,6 +113,7 @@
 - `internal/consumer`：消费、flush、reclaim、DLQ 状态机
 - `internal/dbx`：MySQL 连接池、建表、批量幂等落库
 - `internal/redisx`：Redis 客户端与生产端 Lua 脚本
+- `cmd/replaydlq`：DLQ 回灌工具
 
 ## 3. 数据流
 
@@ -138,7 +163,30 @@ sequenceDiagram
     end
 ```
 
-## 4. MySQL 表设计
+## 4. 它为什么更适合金融日志旁路
+
+这套方案最适合的不是“资金余额强一致更新”，而是：
+
+- 交易审计日志
+- 风控流水
+- 操作留痕
+- 对账辅助事件
+
+原因是它把关键目标放在了下面这几个能力上：
+
+- 主交易链路不被日志落库阻塞
+- 日志链路在高峰期可削峰、可排队
+- 出现故障后可以继续补偿，不依赖人工从零找回
+- 通过幂等主键和 replay 机制避免重复入库污染审计表
+
+如果你要承诺更强的“不丢”语义，建议继续补这几层：
+
+1. Redis 提升为更严格的持久化与副本确认策略
+2. 增加业务流水与审计表之间的对账任务
+3. 为 replay 增加审批、批次号和操作审计
+4. 为 producer 增加入口级限流和背压控制
+
+## 5. MySQL 表设计
 
 消费者启动时会自动创建表：
 
@@ -162,7 +210,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 - `stream_id` 保留 Stream 侧观测信息，便于排障
 - `payload` 保存原始消息体
 
-## 5. 配置项
+## 6. 配置项
 
 ### Redis / Stream
 
@@ -202,7 +250,7 @@ CREATE TABLE IF NOT EXISTS audit_logs (
 - `root:root_pass@tcp(localhost:3306)/audit_log?parseTime=true`
 - `root:root_pass@tcp(localhost:3307)/audit_log?parseTime=true`
 
-## 6. 本地启动
+## 7. 本地启动
 
 如果你在国内网络环境，建议先设置 Go 代理：
 
@@ -262,7 +310,7 @@ Grafana 会自动加载 `Redis MQ Overview` 仪表盘，不需要手动配数据
 - 批大小分布：`redismq_consumer_batch_size`
 - DB 写入延迟：`redismq_consumer_db_write_seconds`
 
-## 7. 关键实现决策
+## 8. 关键实现决策
 
 ### 为什么 ACK 放在 DB 成功之后
 
@@ -281,12 +329,12 @@ Grafana 会自动加载 `Redis MQ Overview` 仪表盘，不需要手动配数据
 
 reclaim 的目标是恢复正确性，不是追求峰值吞吐。超时消息通常意味着消费者曾经异常退出、数据库波动或消息本身存在问题，此时单条重放更容易控制风险和记录原因。
 
-## 8. 当前边界
+## 9. 当前边界
 
-这个仓库已经具备生产可用的最小闭环，但仍有明确边界：
+这个仓库已经具备金融日志高可靠最终一致性的最小闭环，但仍有明确边界：
 
 - 已有 Prometheus 与 Grafana 面板，但还没有告警规则
-- DLQ 目前只做 Redis Stream 隔离，还没有 replay 工具
+- DLQ 已支持 replay，但还没有审批流、批次号和操作留痕
 - 没有做分库分表、跨机房容灾、限流熔断
 - 没有做集成测试与压测基准
 - 生产者示例目前是演示流量，不是业务 API
@@ -294,11 +342,11 @@ reclaim 的目标是恢复正确性，不是追求峰值吞吐。超时消息通
 如果你要继续往线上化推进，下一步最值得补的是：
 
 1. 告警规则：DLQ 激增、DB 延迟升高、持续 reclaim
-2. DLQ replay 工具：按 `event_id` 重放
+2. 对账任务：按业务流水核对 Redis 事件数、DB 落库数、DLQ 数
 3. 集成测试：容器内验证重复投递、DB 故障、消费者崩溃恢复
 4. 后压控制：根据 pending 和 DB 延迟动态调低消费速度
 
-## 9. 验证
+## 10. 验证
 
 本地静态验证已通过：
 
