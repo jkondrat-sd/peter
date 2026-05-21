@@ -1,0 +1,341 @@
+openapi: 3.1.0
+info:
+  title: Redis MQ Audit System API
+  description: |
+    Comprehensive REST, metrics, and telemetry contract for the Redis Stream + MySQL high-reliability financial log auditing pipeline.
+
+    This API contract represents both the standard telemetry interfaces (exposed via `/metrics` on ports `2111`/`2112`) and the proposed queue management endpoints (for event ingestion, DLQ inspection, and retry replays).
+
+    ### Key Operations
+    - **Producer Telemetry**: `/metrics` (Port 2111) for monitoring publication and suppression rates.
+    - **Consumer Telemetry**: `/metrics` (Port 2112) for tracking batch flush status, buffer size, DB latencies, and PEL reclaim events.
+    - **Event Ingestion**: Ingest log records with atomic Lua-based deduplication checks.
+    - **DLQ Management**: Inspect, replay, and delete problematic messages from the Dead Letter Queue.
+  version: 1.0.0
+  contact:
+    name: Financial Audit Infrastructure Team
+    email: audit-infra-support@example.com
+
+servers:
+  - url: http://localhost:2111
+    description: Producer Metrics Server
+  - url: http://localhost:2112
+    description: Consumer Metrics Server
+  - url: http://localhost:8080/api/v1
+    description: Proposed Management Gateway (Production)
+
+tags:
+  - name: Ingestion
+    description: Operations related to sending new events to the audit stream
+  - name: Dead Letter Queue (DLQ)
+    description: Inspecting, re-injecting, and deleting failed messages
+  - name: Telemetry
+    description: System metrics, consumer lag tracking, and performance statistics
+
+paths:
+  /metrics:
+    get:
+      tags:
+        - Telemetry
+      summary: Prometheus Metrics
+      description: |
+        Returns telemetry data in standard Prometheus exposition format. Exposes counters for published messages, database flush failures, DLQ routing occurrences, and gauges indicating current consumer buffer sizes.
+      responses:
+        '200':
+          description: Telemetry gathered successfully
+          content:
+            text/plain; version=0.0.4:
+              schema:
+                type: string
+                example: |
+                  # HELP redismq_producer_published_total Total number of stream events published.
+                  # TYPE redismq_producer_published_total counter
+                  redismq_producer_published_total 4210
+                  # HELP redismq_consumer_buffer_size Current in-memory buffer size.
+                  # TYPE redismq_consumer_buffer_size gauge
+                  redismq_consumer_buffer_size 12
+
+  /events:
+    post:
+      tags:
+        - Ingestion
+      summary: Publish Event (Lua Deduplicated)
+      description: |
+        Submits an audit log record into the queue.
+        Under the hood, a Lua script atomically verifies idempotency (`SET event_id EX <TTL> NX`) and enqueues to the Redis Stream (`XADD`) in a single step to avoid race conditions.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/IngestEventRequest'
+      responses:
+        '201':
+          description: Event successfully deduplicated and appended to the stream
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IngestEventResponse'
+        '409':
+          description: Duplicate event suppressed by producer-side TTL deduplication
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                code: DUPLICATE_EVENT_SUPPRESSED
+                message: Duplicate event suppressed. An identical event_id was published within the deduplication window.
+
+  /dlq:
+    get:
+      tags:
+        - Dead Letter Queue (DLQ)
+      summary: Inspect DLQ Messages
+      description: |
+        Retrieves entries currently located in the Dead Letter Stream (`event_queue_dlq`). These represent messages that have continuously failed consumer persistence and exceeded the retry limit.
+      parameters:
+        - name: count
+          in: query
+          description: Number of entries to retrieve from the DLQ stream
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: Successfully fetched DLQ entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DLQEntry'
+
+  /dlq/replay:
+    post:
+      tags:
+        - Dead Letter Queue (DLQ)
+      summary: Replay/Re-inject DLQ Entries
+      description: |
+        Iterates over the specified count of DLQ entries, extracts original event payloads, and re-adds them to the primary queue (`event_queue`). Successfully replayed entries are deleted from the DLQ by default.
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ReplayDLQRequest'
+      responses:
+        '200':
+          description: DLQ replay operation finished
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayDLQResponse'
+        '500':
+          description: DLQ replay operation completed with partial or total failures
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ReplayDLQResponse'
+
+  /dlq/{dlq_id}:
+    delete:
+      tags:
+        - Dead Letter Queue (DLQ)
+      summary: Delete DLQ Entry
+      description: Permanently deletes a specific message from the Dead Letter Queue stream without replaying it.
+      parameters:
+        - name: dlq_id
+          in: path
+          description: The Redis Stream message ID of the DLQ entry (e.g., '1716301292000-0')
+          required: true
+          schema:
+            type: string
+      responses:
+        '204':
+          description: Entry successfully deleted from the DLQ stream
+        '404':
+          description: DLQ entry not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    IngestEventRequest:
+      type: object
+      required:
+        - event_id
+        - session_id
+        - payload
+      properties:
+        event_id:
+          type: string
+          format: uuid
+          description: Unique transaction or log identifier generated by the client. Used to enforce exact-once delivery constraints.
+          example: d290754a-51b8-4c9f-855f-8c38a2c26d11
+        session_id:
+          type: string
+          format: uuid
+          description: Tracks the client or application session of the auditing payload.
+          example: 8c38a2c2-855f-4c9f-51b8-d290754a51b8
+        payload:
+          type: object
+          description: The transactional log audit payload.
+          properties:
+            user:
+              type: string
+              example: alice
+            status:
+              type: string
+              example: active
+            amount:
+              type: number
+              format: float
+              example: 450.5
+            currency:
+              type: string
+              example: USD
+
+    IngestEventResponse:
+      type: object
+      required:
+        - success
+        - event_id
+        - stream_id
+        - timestamp
+      properties:
+        success:
+          type: boolean
+          example: true
+        event_id:
+          type: string
+          format: uuid
+          example: d290754a-51b8-4c9f-855f-8c38a2c26d11
+        stream_id:
+          type: string
+          description: The assigned Redis Stream message ID (millisecond-index representation).
+          example: 1716302492100-0
+        timestamp:
+          type: string
+          format: date-time
+          example: "2026-05-21T10:21:32Z"
+
+    Event:
+      type: object
+      required:
+        - stream_id
+        - event_id
+        - session_id
+        - payload
+        - produced_at
+      properties:
+        stream_id:
+          type: string
+          description: Message ID of the event in the main Redis Stream.
+          example: 1716302492100-0
+        event_id:
+          type: string
+          format: uuid
+          example: d290754a-51b8-4c9f-855f-8c38a2c26d11
+        session_id:
+          type: string
+          format: uuid
+          example: 8c38a2c2-855f-4c9f-51b8-d290754a51b8
+        payload:
+          type: string
+          description: JSON marshaled payload string stored in the stream.
+          example: "{\"user\":\"alice\",\"status\":\"active\",\"amount\":450.5,\"currency\":\"USD\"}"
+        produced_at:
+          type: string
+          format: date-time
+          example: "2026-05-21T10:21:30.005Z"
+
+    DLQEntry:
+      type: object
+      required:
+        - dlq_id
+        - event
+        - reason_code
+        - reason
+        - retry_count
+        - failed_at
+      properties:
+        dlq_id:
+          type: string
+          description: Message ID of the event in the DLQ Redis Stream.
+          example: 1716302604000-0
+        event:
+          $ref: '#/components/schemas/Event'
+        reason_code:
+          type: string
+          description: Categorized failure code.
+          example: DB_CONN_TIMEOUT
+        reason:
+          type: string
+          description: Explanatory error details and consumer failure stack trace trace.
+          example: "dial tcp 127.0.0.1:3306: connect: connection refused"
+        retry_count:
+          type: integer
+          description: Number of processing deliveries attempted before routing message to the DLQ.
+          example: 5
+        failed_at:
+          type: string
+          format: date-time
+          example: "2026-05-21T10:21:34.120Z"
+
+    ReplayDLQRequest:
+      type: object
+      properties:
+        count:
+          type: integer
+          description: Max count of messages to reclaim and replay in this batch.
+          default: 100
+          example: 50
+        keep_source:
+          type: boolean
+          description: If true, replayed events will not be deleted from the DLQ stream.
+          default: false
+          example: false
+
+    ReplayDLQResponse:
+      type: object
+      required:
+        - status
+        - replayed
+        - failed
+        - keep_source
+      properties:
+        status:
+          type: string
+          enum: [COMPLETED, PARTIAL_FAILURE, FAILED]
+          example: COMPLETED
+        replayed:
+          type: integer
+          description: Total count of DLQ messages successfully enqueued back to the primary stream.
+          example: 12
+        failed:
+          type: integer
+          description: Count of messages which failed parsing or requeuing.
+          example: 0
+        keep_source:
+          type: boolean
+          example: false
+
+    ErrorResponse:
+      type: object
+      required:
+        - code
+        - message
+      properties:
+        code:
+          type: string
+          description: A structured, programmatically checkable error code string.
+          example: RESOURCE_NOT_FOUND
+        message:
+          type: string
+          description: A human-readable description of the encountered error.
+          example: The requested DLQ entry does not exist or has already been cleared.
