@@ -16,7 +16,7 @@ services:
       retries: 20
 
   mysql-master:
-    image: bitnami/mariadb:latest
+    image: soldevelo/mariadb:latest
     container_name: mysql-master
     environment:
       - MARIADB_REPLICATION_MODE=master
@@ -33,7 +33,7 @@ services:
       retries: 20
 
   mysql-slave:
-    image: bitnami/mariadb:latest
+    image: soldevelo/mariadb:latest
     container_name: mysql-slave
     depends_on:
       - mysql-master
